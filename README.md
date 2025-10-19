@@ -1,6 +1,6 @@
 # U-Net COVID-19 CT图像分割
 
-基于PyTorch实现U-Net网络，完成COVID-19肺部CT图像感染区域的语义分割。
+基于PyTorch实现U-Net网络，完成COVID-19肺部CT图像感染区域的语义分割。感谢claude知道喵喵喵🐱～～～
 
 ## 项目简介
 
@@ -9,12 +9,7 @@
 - **数据集**: 2729张CT图像
 - **效果**: Dice 0.84, IoU 0.74
 
-## 环境配置
-```bash
-conda create -n unet python=3.9
-conda activate unet
-pip install torch torchvision numpy matplotlib pillow opencv-python tqdm albumentations
-```
+
 
 ## 项目结构
 ```
