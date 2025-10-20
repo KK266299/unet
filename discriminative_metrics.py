@@ -1,200 +1,120 @@
-"""Discriminative score metric utilities."""
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Iterable, Sequence, Tuple
-
-import numpy as np
 import torch
+import torch.nn as nn
+import numpy as np
 from sklearn.metrics import accuracy_score
-from torch import Tensor, nn
-from torch.nn.utils.rnn import pack_padded_sequence
-from torch.optim import Adam
+from utils import extract_time, MinMaxScaler,  train_test_divide, batch_generator, pad_sequences
 
+def discriminative_score_metrics (ori_data, generated_data):
+    no, seq_len, dim = np.asarray(ori_data).shape
 
-class Discriminator(nn.Module):
-    """Simple GRU based discriminator used for the discriminative score."""
+    ori_time, ori_max_seq_len = extract_time(ori_data)
+    generated_time, generated_max_seq_len = extract_time(generated_data)
+    max_seq_len = max([ori_max_seq_len, generated_max_seq_len])  
 
-    def __init__(self, feature_dim: int, hidden_dim: int) -> None:
-        super().__init__()
-        self.gru = nn.GRU(feature_dim, hidden_dim, batch_first=True)
-        self.output = nn.Linear(hidden_dim, 1)
-
-    def forward(self, sequences: Tensor, lengths: Tensor) -> Tuple[Tensor, Tensor, None]:
-        lengths_cpu = lengths.detach().cpu()
-        packed = pack_padded_sequence(
-            sequences, lengths_cpu, batch_first=True, enforce_sorted=False
-        )
-        _, last_hidden = self.gru(packed)
-        last_hidden = last_hidden[-1]
-        logits = self.output(last_hidden)
-        probabilities = torch.sigmoid(logits)
-        return logits, probabilities, None
-
-
-def extract_time(data: Sequence[np.ndarray]) -> Tuple[np.ndarray, int]:
-    lengths = []
-    max_seq_len = 0
-    for sequence in data:
-        array = np.asarray(sequence)
-        if array.ndim == 1:
-            array = np.expand_dims(array, -1)
-        if array.size == 0:
-            length = 0
-        else:
-            row_sums = np.abs(array).sum(axis=-1)
-            non_padding = np.where(row_sums > 0)[0]
-            length = int(non_padding[-1] + 1) if non_padding.size > 0 else array.shape[0]
-        lengths.append(max(1, length))
-        max_seq_len = max(max_seq_len, array.shape[0])
-    return np.asarray(lengths, dtype=np.int64), max_seq_len
-
-
-def _ensure_numpy_array(data: Iterable, max_seq_len: int) -> np.ndarray:
-    array = np.asarray(data)
-    if array.ndim == 3 and array.dtype != object and array.shape[1] == max_seq_len:
-        return array.astype(np.float32)
-
-    padded = []
-    for sequence in data:
-        seq_array = np.asarray(sequence, dtype=np.float32)
-        if seq_array.ndim == 1:
-            seq_array = np.expand_dims(seq_array, -1)
-        if seq_array.shape[0] > max_seq_len:
-            raise ValueError("Sequence length exceeds maximum sequence length.")
-        pad_len = max_seq_len - seq_array.shape[0]
-        if pad_len > 0:
-            padding = np.zeros((pad_len, seq_array.shape[-1]), dtype=np.float32)
-            seq_array = np.concatenate([seq_array, padding], axis=0)
-        padded.append(seq_array)
-    return np.stack(padded, axis=0)
-
-
-@dataclass
-class TrainTestSplit:
-    train_x: np.ndarray
-    train_x_hat: np.ndarray
-    test_x: np.ndarray
-    test_x_hat: np.ndarray
-    train_t: np.ndarray
-    train_t_hat: np.ndarray
-    test_t: np.ndarray
-    test_t_hat: np.ndarray
-
-
-def train_test_divide(
-    ori_data: np.ndarray,
-    generated_data: np.ndarray,
-    ori_time: np.ndarray,
-    generated_time: np.ndarray,
-) -> TrainTestSplit:
-    num_samples = ori_data.shape[0]
-    if num_samples != generated_data.shape[0]:
-        raise ValueError("Original and generated data must have the same number of samples.")
-    if num_samples < 2:
-        raise ValueError("Need at least two sequences to compute the discriminative score.")
-    split = int(0.8 * num_samples)
-    split = min(max(split, 1), num_samples - 1)
-
-    return TrainTestSplit(
-        train_x=ori_data[:split],
-        train_x_hat=generated_data[:split],
-        test_x=ori_data[split:],
-        test_x_hat=generated_data[split:],
-        train_t=ori_time[:split],
-        train_t_hat=generated_time[:split],
-        test_t=ori_time[split:],
-        test_t_hat=generated_time[split:],
-    )
-
-
-def batch_generator(
-    data: np.ndarray, time: np.ndarray, batch_size: int
-) -> Tuple[np.ndarray, np.ndarray]:
-    num_samples = data.shape[0]
-    if num_samples == 0:
-        raise ValueError("Cannot generate a batch from an empty dataset.")
-
-    indices = np.random.permutation(num_samples)[:batch_size]
-    return data[indices], time[indices]
-
-
-def discriminative_score_metrics(
-    ori_data: Sequence[Sequence[float]],
-    generated_data: Sequence[Sequence[float]],
-    iterations: int = 2000,
-    batch_size: int = 128,
-) -> float:
+    hidden_dim = int(dim/2)
+    iterations = 2000
+    batch_size = 128
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ori_sequences = [np.asarray(sequence) for sequence in ori_data]
-    generated_sequences = [np.asarray(sequence) for sequence in generated_data]
+    # ========== 输入占位说明（对应TensorFlow的placeholder） ==========
+    # X:     [None, max_seq_len, dim]  - 真实数据输入 (myinput_x)
+    # X_hat: [None, max_seq_len, dim]  - 生成数据输入 (myinput_x_hat)
+    # T:     [None]                    - 真实数据序列长度 (myinput_t)
+    # T_hat: [None]                    - 生成数据序列长度 (myinput_t_hat)
+    # 
+    # 注意：PyTorch不需要预定义placeholder，在训练循环中直接使用tensor
+    # ================================================================
 
-    if len(ori_sequences) == 0 or len(generated_sequences) == 0:
-        raise ValueError("Original and generated data must be non-empty.")
-    if len(ori_sequences) != len(generated_sequences):
-        raise ValueError("Original and generated data must contain the same number of sequences.")
+    class Discriminator(nn.Module):
+        def __init__(self, input_dim, hidden_dim):
+            super(Discriminator, self).__init__()
+            self.gru = nn.GRU(
+                input_size=input_dim, 
+                hidden_size=hidden_dim, 
+                num_layers=1, 
+                batch_first=True
+                )
 
-    ori_time, ori_max_seq_len = extract_time(ori_sequences)
-    generated_time, generated_max_seq_len = extract_time(generated_sequences)
-    max_seq_len = max(ori_max_seq_len, generated_max_seq_len)
-    if max_seq_len == 0:
-        raise ValueError("Sequences must contain at least one timestep.")
+            self.fc = nn.Linear(hidden_dim, 1)
 
-    ori_array = _ensure_numpy_array(ori_sequences, max_seq_len)
-    generated_array = _ensure_numpy_array(generated_sequences, max_seq_len)
+        def forward(self, x, t):
+            packed_input = nn.utils.rnn.pack_padded_sequence(
+                x,
+                t.cpu(),
+                batch_first=True,
+                enforce_sorted=False
+            )
+            d_output, hidden_pre = self.gru(packed_input)
+            d_last_states = hidden_pre.squeeze(0)
 
-    if ori_array.shape[-1] == 1:
-        ori_array = np.concatenate([ori_array, ori_array], axis=-1)
-        generated_array = np.concatenate([generated_array, generated_array], axis=-1)
+            y_hat_logit = self.fc(d_last_states)
+            y_hat = torch.sigmoid(y_hat_logit)
+            d_vars = list(self.parameters())
 
-    _, _, feature_dim = ori_array.shape
-    hidden_dim = max(1, feature_dim // 2)
+            return y_hat_logit, y_hat, d_vars
 
-    discriminator_model = Discriminator(feature_dim, hidden_dim).to(device)
+    discriminator = Discriminator(dim, hidden_dim).to(device)
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = Adam(discriminator_model.parameters())
+    optimizer = torch.optim.Adam(discriminator.parameters())
+    train_x, train_x_hat, test_x, test_x_hat, train_t, train_t_hat, test_t, test_t_hat = \
+        train_test_divide(ori_data, generated_data, ori_time, generated_time)
+    
+    discriminator.train()
+    for it in range(iterations):
+        X_mb, T_mb = batch_generator(train_x, train_t, batch_size)
+        X_hat_mb, T_hat_mb = batch_generator(train_x_hat, train_t_hat, batch_size)
 
-    split = train_test_divide(ori_array, generated_array, ori_time, generated_time)
+        """
+        #padding
+        packed_input = nn.utils.rnn.pack_padded_sequence(
+                x,
+                t.cpu(),
+                batch_first=True,
+                enforce_sorted=False
+            ) 因为pytorch无法像tf直接处理变长序列,先填充在用这个函数剔除
+        # Padding 
+        """
 
-    discriminator_model.train()
-    for _ in range(iterations):
-        batch_x, batch_t = batch_generator(split.train_x, split.train_t, batch_size)
-        batch_x_hat, batch_t_hat = batch_generator(
-            split.train_x_hat, split.train_t_hat, batch_size
-        )
+        X_mb_padded = pad_sequences(X_mb, max_seq_len)
+        X_hat_mb_padded = pad_sequences(X_hat_mb, max_seq_len)
 
-        real_sequences = torch.from_numpy(batch_x).to(device)
-        real_lengths = torch.from_numpy(batch_t).to(device)
-        fake_sequences = torch.from_numpy(batch_x_hat).to(device)
-        fake_lengths = torch.from_numpy(batch_t_hat).to(device)
+        X = torch.FloatTensor(X_mb_padded).to(device)         # myinput_x
+        X_hat = torch.FloatTensor(X_hat_mb_padded).to(device) # myinput_x_hat
+        T = torch.LongTensor(T_mb).to(device)                 # myinput_t
+        T_hat = torch.LongTensor(T_hat_mb).to(device)         # myinput_t_hat
 
-        logits_real, _, _ = discriminator_model(real_sequences, real_lengths)
-        logits_fake, _, _ = discriminator_model(fake_sequences, fake_lengths)
+        y_logit_real, _, _ = discriminator(X, T)
+        y_logit_fake, _, _ = discriminator(X_hat, T_hat)
 
-        loss_real = criterion(logits_real, torch.ones_like(logits_real))
-        loss_fake = criterion(logits_fake, torch.zeros_like(logits_fake))
-        loss = loss_real + loss_fake
+        labels_real = torch.ones_like(y_logit_real)
+        labels_fake = torch.zeros_like(y_logit_fake)
+        d_loss_real = criterion(y_logit_real, labels_real)
+        d_loss_fake = criterion(y_logit_fake, labels_fake)
+        d_loss = d_loss_real + d_loss_fake
 
         optimizer.zero_grad()
-        loss.backward()
+        d_loss.backward()
         optimizer.step()
-
-    discriminator_model.eval()
+    
+    discriminator.eval()
     with torch.no_grad():
-        test_x = torch.from_numpy(split.test_x).to(device)
-        test_t = torch.from_numpy(split.test_t).to(device)
-        test_x_hat = torch.from_numpy(split.test_x_hat).to(device)
-        test_t_hat = torch.from_numpy(split.test_t_hat).to(device)
+        test_x_padded = pad_sequences(test_x, max_seq_len)
+        test_x_hat_padded = pad_sequences(test_x_hat, max_seq_len)
+        
+        X = torch.FloatTensor(test_x_padded).to(device)
+        X_hat = torch.FloatTensor(test_x_hat_padded).to(device)
+        T = torch.LongTensor(test_t).to(device)
+        T_hat = torch.LongTensor(test_t_hat).to(device)
+        _, y_pred_real, _ = discriminator(X, T)
+        _, y_pred_fake, _ = discriminator(X_hat, T_hat)
 
-        logits_real, _, _ = discriminator_model(test_x, test_t)
-        logits_fake, _, _ = discriminator_model(test_x_hat, test_t_hat)
+        y_pred_real_curr = y_pred_real.cpu().numpy()
+        y_pred_fake_curr = y_pred_fake.cpu().numpy()
 
-    probabilities = torch.sigmoid(torch.cat([logits_real, logits_fake], dim=0))
-    y_pred = probabilities.cpu().numpy().squeeze()
-    labels = np.concatenate(
-        [np.ones(len(logits_real)), np.zeros(len(logits_fake))], axis=0
-    )
-
-    accuracy = accuracy_score(labels, y_pred > 0.5)
-    return float(np.abs(0.5 - accuracy))
+        y_pred_final = np.squeeze(np.concatenate((y_pred_real_curr, y_pred_fake_curr), axis=0))
+        y_label_final = np.concatenate((np.ones([len(y_pred_real_curr),]), 
+                                     np.zeros([len(y_pred_fake_curr),])), axis=0)
+        acc = accuracy_score(y_label_final, (y_pred_final > 0.5))
+        discriminative_score = np.abs(0.5 - acc)
+    
+    return discriminative_score
